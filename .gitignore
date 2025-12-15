@@ -1,0 +1,14 @@
+# .gitignore 文件内容
+
+# 忽略环境配置文件
+.env
+
+# 忽略编译出来的二进制文件
+indexer
+indexer.exe
+main
+main.exe
+
+# 忽略 IDE 的配置文件夹 (可选)
+.idea/
+.vscode/
