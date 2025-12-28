@@ -7,25 +7,32 @@ import (
 	"strings"
 )
 
+const hexPrefix = "0x"
+
+// HexToInt64 converts a hexadecimal string to a 64-bit integer
+// Returns 0 if conversion fails
 func HexToInt64(hexStr string) int64 {
-	cleanStr := strings.TrimPrefix(hexStr, "0x")
+	cleanStr := strings.TrimPrefix(hexStr, hexPrefix)
 
 	val, err := strconv.ParseInt(cleanStr, 16, 64)
 	if err != nil {
-		fmt.Println("Hex转换失败", err)
+		fmt.Println("Hex conversion failed:", err)
 		return 0
 	}
+
 	return val
 }
 
+// HexToBigInt converts a hexadecimal string to a big.Int
+// Returns 0 if conversion fails
 func HexToBigInt(hexStr string) *big.Int {
-	n := new(big.Int)
+	cleanStr := strings.TrimPrefix(hexStr, hexPrefix)
 
-	cleanStr := strings.TrimPrefix(hexStr, "0x")
-
-	n, ok := n.SetString(cleanStr, 16)
+	result := new(big.Int)
+	result, ok := result.SetString(cleanStr, 16)
 	if !ok {
 		return new(big.Int)
 	}
-	return n
+
+	return result
 }

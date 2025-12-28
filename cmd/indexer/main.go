@@ -5,16 +5,20 @@ import (
 	"whale-watcher/pkg/config"
 )
 
+// main initializes the indexer application and starts the event loop
 func main() {
+	// Load configuration from environment or config file
 	cfg, err := config.Load()
-
 	if err != nil {
-		log.Fatal("配置加载失败")
+		log.Fatal("Configuration loading failed:", err)
 	}
+
+	// Initialize application with loaded configuration
 	app, err := Initialize(cfg)
 	if err != nil {
-		log.Fatal("应用初始化失败:", err)
+		log.Fatal("Application initialization failed:", err)
 	}
-	log.Println("🚀 Indexer 服务启动中...")
+
+	log.Println("🚀 Indexer service starting...")
 	app.Run()
 }

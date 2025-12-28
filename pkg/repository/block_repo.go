@@ -12,6 +12,7 @@ type BlockRepository interface {
 	GetLastBlock() (*model.SQLBlock, error)
 	GetByHeight(height uint64) (*model.SQLBlock, error)
 	DeleteByHeightGreaterThan(height uint64) error
+	GetMaxHeight() (uint64, error)
 }
 
 type blockRepo struct {
@@ -49,4 +50,19 @@ func (r *blockRepo) GetByHeight(height uint64) (*model.SQLBlock, error) {
 
 func (r *blockRepo) DeleteByHeightGreaterThan(height uint64) error {
 	return r.db.Where("height >?", height).Delete(&model.SQLBlock{}).Error
+}
+
+func (r *blockRepo) GetMaxHeight() (uint64, error) {
+
+	var block model.SQLBlock
+
+	err := r.db.Select("height").Order("height desc").First(&block).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return 0, nil
+		}
+		return 0, errors.ErrUnsupported
+	}
+	return block.Height, nil
+
 }

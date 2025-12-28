@@ -20,19 +20,19 @@ func (m *MockClient) FetchBlock(ctx context.Context, height int) (*model.Block, 
 		Timestamp: "0x654321",
 		Transactions: []model.Transaction{
 			{Hash: "0xTx1...", Value: "0xDE0B6B3A7640000"},    // 1 ETH
-			{Hash: "0xTx2...", Value: "0x3635C9ADC5DEA00000"}, // 1000 ETH (巨鲸!)
+			{Hash: "0xTx2...", Value: "0x3635C9ADC5DEA00000"}, // 1000 ETH (whale!)
 		},
 	}
 	select {
 
-	// 情况 A: 模拟网络耗时 (3秒后触发)
+	// Case A: Simulate network latency (triggered after 3 seconds)
 	case <-time.After(500 * time.Millisecond):
-		fmt.Printf("👻 [Mock] 假装从网络获取了区块 #%d\n", height)
+		fmt.Printf("👻 [Mock] Pretend to fetch block #%d from network\n", height)
 		return mockBlock, nil
 
-	// 情况 B: Context 超时或被取消 (2秒时就会触发)
+	// Case B: Context timeout or cancellation (triggered at 2 seconds)
 	case <-ctx.Done():
-		// 既然超时了，就立刻返回错误，不要再返回 Block 了
-		return nil, ctx.Err() // 返回 "context deadline exceeded"
+		// If timeout occurred, return error immediately, don't return Block
+		return nil, ctx.Err() // returns "context deadline exceeded"
 	}
 }
