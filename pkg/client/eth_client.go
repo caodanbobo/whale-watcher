@@ -6,17 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"time"
 	"whale-watcher/pkg/model"
 )
 
 const (
-	rpcMethodGetBlock = "eth_getBlockByNumber"
-	rpcVersion        = "2.0"
-	rpcID             = 1
-	httpContentType   = "application/json"
+	rpcMethodGetBlock  = "eth_getBlockByNumber"
+	rpcVersion         = "2.0"
+	rpcID              = 1
+	httpContentType    = "application/json"
 	defaultHTTPTimeout = 10 * time.Second
 )
 
@@ -94,3 +93,5 @@ func (c *EthClient) sendRPCRequest(ctx context.Context, rpcRequest model.RPCRequ
 		return nil, fmt.Errorf("failed to unmarshal RPC response: %w", err)
 	}
 
+	return &rpcResponse.Result, nil
+}

@@ -5,6 +5,7 @@ import (
 	"whale-watcher/pkg/model"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type BlockRepository interface {
@@ -26,7 +27,10 @@ func NewBlockRepo(db *gorm.DB) BlockRepository {
 }
 
 func (r *blockRepo) Save(block *model.SQLBlock) error {
-	return r.db.Save(block).Error
+	return r.db.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "height"}},
+		UpdateAll: true,
+	}).Create(block).Error
 }
 
 func (r *blockRepo) GetLastBlock() (*model.SQLBlock, error) {

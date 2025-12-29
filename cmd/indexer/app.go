@@ -119,28 +119,77 @@ func (a *App) startWebSocketListener() {
 			log.Fatal("Subscription interrupted with error:", err)
 
 		case header := <-headers:
-			go a.ProcessBlock(header)
+			a.ProcessBlock(header)
 		}
 	}
 }
 
 // ProcessBlock fetches and stores a new block
 func (a *App) ProcessBlock(header *types.Header) {
-	block, err := a.EthClient.BlockByHash(context.Background(), header.Hash())
+	ctx := context.Background()
+	block, err := a.EthClient.BlockByHash(ctx, header.Hash())
 	if err != nil {
 		log.Printf("❌ Failed to fetch block body #%s: %v", header.Number.String(), err)
 		return
 	}
-
-	fmt.Printf("🧱 New block: #%s | Hash: %s | Txs: %d\n",
-		block.Number().String(), block.Hash().Hex(), len(block.Transactions()))
-
-	sqlBlock := a.blockToSQLBlock(block)
-	if err := a.BlockRepo.Save(&sqlBlock); err != nil {
-		log.Printf("❌ Database save failed: %v", err)
-	} else {
-		log.Printf("💾 Saved to DB (ID: %d)", sqlBlock.ID)
+	newHeight := block.NumberU64()
+	newParentHash := block.ParentHash().Hex()
+	localTip, err := a.BlockRepo.GetLastBlock()
+	if err != nil {
+		log.Printf("❌ Failed to get local tip height: %v", err)
+		return
 	}
+	if localTip == nil {
+		a.saveBlock(block)
+		return
+	}
+	if newHeight == localTip.Height+1 && newParentHash == localTip.Hash {
+		a.saveBlock(block)
+		return
+	}
+	log.Printf("⚠️ Detected chain reorganization at block #%s", block.Number().String())
+	if err := a.ResolveReorg(ctx, localTip, block); err != nil {
+		log.Printf("❌ Repairing failed: %v", err)
+	}
+	log.Printf("✅ Repair complete up to block #%s", block.Number().String())
+
+}
+
+func (a *App) ResolveReorg(ctx context.Context, localTip *model.SQLBlock, newHead *types.Block) error {
+	currentHeight := localTip.Height
+	for {
+		if currentHeight == 0 {
+			break
+		}
+		onChainBlock, err := a.EthClient.BlockByNumber(ctx, big.NewInt(int64(currentHeight)))
+		if err != nil {
+			return fmt.Errorf("failed to fetch block #%d from chain: %w", currentHeight, err)
+		}
+		localBlock, err := a.BlockRepo.GetByHeight(currentHeight)
+		if err != nil {
+			return fmt.Errorf("failed to fetch local block #%d: %w", currentHeight, err)
+		}
+		if localBlock.Hash != onChainBlock.Hash().Hex() {
+			log.Printf("🔄 Replacing local block #%d (hash: %s) with on-chain hash: %s", currentHeight, localBlock.Hash, onChainBlock.Hash().Hex())
+			if err := a.saveBlock(onChainBlock); err != nil {
+				return fmt.Errorf("failed to save corrected block #%d: %w", currentHeight, err)
+			}
+			currentHeight--
+		} else {
+			break
+		}
+	}
+	startBackfill := localTip.Height + 1
+	endBackfill := newHead.NumberU64()
+	if startBackfill <= endBackfill {
+		log.Printf("🔄 Backfilling blocks from #%d to #%d after reorg", startBackfill, endBackfill)
+		for h := startBackfill; h <= endBackfill; h++ {
+			if err := a.fetchAndSaveBlock(ctx, int64(h)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // blockToSQLBlock converts an Ethereum block to a database-ready format
@@ -157,6 +206,11 @@ func (a *App) blockToSQLBlock(block *types.Block) model.SQLBlock {
 		TxCount:   len(block.Transactions()),
 		BaseFee:   baseFee,
 	}
+}
+
+func (a *App) saveBlock(block *types.Block) error {
+	sqlBlock := a.blockToSQLBlock(block)
+	return a.BlockRepo.Save(&sqlBlock)
 }
 
 // Backfill synchronizes historical blocks that were missed
@@ -224,7 +278,7 @@ func (a *App) blockSyncWorker(ctx context.Context, workerID int, blockChan chan 
 	defer wg.Done()
 
 	for blockNumber := range blockChan {
-		if err := a.fetchAndSaveBlock(ctx, int64(blockNumber)); err != nil {
+		if err := a.fetchAndSaveBlockWithRetry(ctx, int64(blockNumber)); err != nil {
 			a.AsyncLog("❌ [Worker %d] Failed #%d: %v", workerID, blockNumber, err)
 		} else {
 			// Log progress at intervals
@@ -233,6 +287,29 @@ func (a *App) blockSyncWorker(ctx context.Context, workerID int, blockChan chan 
 			}
 		}
 	}
+}
+
+func (a *App) fetchAndSaveBlockWithRetry(ctx context.Context, height int64) error {
+	maxRetries := 3
+	baseDelay := time.Second
+
+	for i := 0; i < maxRetries; i++ {
+		err := a.fetchAndSaveBlock(ctx, height)
+		if err == nil {
+			return nil
+		}
+
+		a.AsyncLog("❌ Retry %d for block #%d failed: %v", i+1, height, err)
+		delay := baseDelay * time.Duration(1<<i) // Exponential backoff
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+			// Continue to next retry
+		}
+	}
+	return fmt.Errorf("failed to fetch and save block #%d after %d retries", height, maxRetries)
 }
 
 // fetchAndSaveBlock retrieves a single block and persists it
