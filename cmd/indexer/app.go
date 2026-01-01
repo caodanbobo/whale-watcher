@@ -20,7 +20,10 @@ import (
 	"gorm.io/gorm"
 )
 
-// Configuration constants
+// =================================================================================
+// Configuration & Constants
+// =================================================================================
+
 const (
 	logChannelCapacity     = 100
 	logChannelBufferSize   = 2
@@ -28,23 +31,38 @@ const (
 	progressReportInterval = 100
 	blockLookbackDistance  = 10
 	httpTimeout            = 10 * time.Second
-	logMessageFormat       = "⚠️ Error during backfill process: %v (program will continue to start)"
+	maxRetries             = 3
+	retryBaseDelay         = time.Second
 )
 
-// App represents the main application with blockchain monitoring capabilities
+// BlockStatus represents the relationship between the new block and our local chain.
+type BlockStatus int
+
+const (
+	StatusCanonical BlockStatus = iota // Normal continuation of the chain
+	StatusGap                          // Block is from the future (missing intermediate blocks)
+	StatusReorg                        // Block conflicts with local history (fork detected)
+)
+
+// =================================================================================
+// Application Structure
+// =================================================================================
+
+// App represents the main indexer application.
+// It manages the database, blockchain connection, and synchronization logic.
 type App struct {
 	Config    *config.Config
 	DB        *gorm.DB
 	EthClient *ethclient.Client
 	BlockRepo repository.BlockRepository
-	LogChan   chan string
+	LogChan   chan string // Dedicated channel for non-blocking logging
 }
 
-// Initialize creates a new App instance with required connections
+// Initialize bootstraps the application dependencies.
 func Initialize(cfg *config.Config) (*App, error) {
 	db, err := initDB(cfg.DB_DSN)
 	if err != nil {
-		log.Fatal("Database connection failed:", err)
+		return nil, fmt.Errorf("database connection failed: %w", err)
 	}
 	fmt.Println("✅ Database connection successful")
 
@@ -52,7 +70,7 @@ func Initialize(cfg *config.Config) (*App, error) {
 
 	client, err := ethclient.Dial(cfg.EthWSURL)
 	if err != nil {
-		log.Fatal("WebSocket connection failed:", err)
+		return nil, fmt.Errorf("websocket connection failed: %w", err)
 	}
 
 	return &App{
@@ -64,126 +82,178 @@ func Initialize(cfg *config.Config) (*App, error) {
 	}, nil
 }
 
-// initDB establishes database connection and runs migrations
 func initDB(dsn string) (*gorm.DB, error) {
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
 		return nil, err
 	}
-	db.AutoMigrate(&model.SQLBlock{})
+	// Ensure the schema is up to date
+	if err := db.AutoMigrate(&model.SQLBlock{}); err != nil {
+		return nil, err
+	}
 	return db, nil
 }
 
-// Run starts the main event loop with block listener and backfill process
+// =================================================================================
+// Main Execution Loop
+// =================================================================================
+
+// Run starts the application components: logger, backfiller, and listener.
 func (a *App) Run() {
+	// 1. Start the async logger consumer
 	go a.startLogger()
 
+	// 2. Start initial backfill in background
+	// Using a separate goroutine prevents blocking the startup flow.
 	go func() {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Perform initial backfill of missing blocks
 		if err := a.Backfill(ctx); err != nil {
-			log.Printf(logMessageFormat, err)
+			log.Printf("⚠️ Error during initial backfill: %v", err)
 		}
 	}()
-	// Start listening for new blocks
+
+	// 3. Start real-time block monitoring
 	go a.startWebSocketListener()
 
-	// Wait for shutdown signal
+	// 4. Block main thread until interrupt signal
 	a.waitForShutdown()
 }
 
-// waitForShutdown blocks until a shutdown signal is received
 func (a *App) waitForShutdown() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	<-quit
 	log.Println("🛑 Received shutdown signal, closing service...")
+	// TODO: Implement graceful shutdown for DB and Workers here
 	log.Println("👋 Bye!")
 }
 
-// startWebSocketListener subscribes to new block headers and processes them
+// =================================================================================
+// Real-time Listener Logic
+// =================================================================================
+
 func (a *App) startWebSocketListener() {
 	headers := make(chan *types.Header)
 
+	// Subscribe to new block headers
 	sub, err := a.EthClient.SubscribeNewHead(context.Background(), headers)
 	if err != nil {
 		log.Fatal("Subscription failed:", err)
 	}
 
+	// Loop indefinitely to process incoming headers
 	for {
 		select {
 		case err := <-sub.Err():
 			log.Fatal("Subscription interrupted with error:", err)
-
 		case header := <-headers:
+			// NOTE: ProcessBlock is called synchronously to ensure sequential processing
+			// of headers, which simplifies reorg handling.
 			a.ProcessBlock(header)
 		}
 	}
 }
 
-// ProcessBlock fetches and stores a new block
+// ProcessBlock is the main entry point for handling a new block header.
+// It determines if the block is canonical, a gap, or a reorg, and acts accordingly.
 func (a *App) ProcessBlock(header *types.Header) {
 	ctx := context.Background()
+
+	// 1. Fetch full block data
 	block, err := a.EthClient.BlockByHash(ctx, header.Hash())
 	if err != nil {
 		log.Printf("❌ Failed to fetch block body #%s: %v", header.Number.String(), err)
 		return
 	}
-	newHeight := block.NumberU64()
-	newParentHash := block.ParentHash().Hex()
+
+	// 2. Get local state
 	localTip, err := a.BlockRepo.GetLastBlock()
 	if err != nil {
-		log.Printf("❌ Failed to get local tip height: %v", err)
+		log.Printf("❌ Failed to get local tip: %v", err)
 		return
 	}
-	if localTip == nil {
-		a.saveBlock(block)
-		return
-	}
-	if newHeight == localTip.Height+1 && newParentHash == localTip.Hash {
-		a.saveBlock(block)
-		return
-	}
-	log.Printf("⚠️ Detected chain reorganization at block #%s", block.Number().String())
-	if err := a.ResolveReorg(ctx, localTip, block); err != nil {
-		log.Printf("❌ Repairing failed: %v", err)
-	}
-	log.Printf("✅ Repair complete up to block #%s", block.Number().String())
 
+	// 3. Determine status
+	status := determineBlockStatus(localTip, block)
+
+	// 4. Handle based on status
+	switch status {
+	case StatusCanonical:
+		// Happy path: just save the block
+		if err := a.saveBlock(block); err != nil {
+			log.Printf("❌ Failed to save canonical block: %v", err)
+		}
+
+	case StatusGap:
+		// Gap detected (e.g., local: 100, new: 105).
+		// We save the future block and assume the Backfill process (or a separate repair job)
+		// will fill the missing blocks (101-104).
+		log.Printf("📥 Gap detected (Local: #%d, New: #%d). Saving future block.", localTip.Height, block.NumberU64())
+		if err := a.saveBlock(block); err != nil {
+			log.Printf("❌ Failed to save gap block: %v", err)
+		}
+
+	case StatusReorg:
+		// Reorg detected (e.g., local: 100, new: 100 but diff hash).
+		log.Printf("⚠️ Reorg detected at block #%s. Starting resolution...", block.Number().String())
+		if err := a.ResolveReorg(ctx, localTip, block); err != nil {
+			log.Printf("❌ Reorg resolution failed: %v", err)
+		} else {
+			log.Printf("✅ Reorg resolved up to block #%s", block.Number().String())
+		}
+	}
 }
 
-func (a *App) ResolveReorg(ctx context.Context, localTip *model.SQLBlock, newHead *types.Block) error {
-	currentHeight := localTip.Height
-	for {
-		if currentHeight == 0 {
-			break
-		}
-		onChainBlock, err := a.EthClient.BlockByNumber(ctx, big.NewInt(int64(currentHeight)))
-		if err != nil {
-			return fmt.Errorf("failed to fetch block #%d from chain: %w", currentHeight, err)
-		}
-		localBlock, err := a.BlockRepo.GetByHeight(currentHeight)
-		if err != nil {
-			return fmt.Errorf("failed to fetch local block #%d: %w", currentHeight, err)
-		}
-		if localBlock.Hash != onChainBlock.Hash().Hex() {
-			log.Printf("🔄 Replacing local block #%d (hash: %s) with on-chain hash: %s", currentHeight, localBlock.Hash, onChainBlock.Hash().Hex())
-			if err := a.saveBlock(onChainBlock); err != nil {
-				return fmt.Errorf("failed to save corrected block #%d: %w", currentHeight, err)
-			}
-			currentHeight--
-		} else {
-			break
-		}
+// determineBlockStatus analyzes the relationship between local tip and new block.
+func determineBlockStatus(local *model.SQLBlock, newBlock *types.Block) BlockStatus {
+	// Case 1: First run (empty DB) -> Treat as canonical
+	if local == nil {
+		return StatusCanonical
 	}
-	startBackfill := localTip.Height + 1
-	endBackfill := newHead.NumberU64()
-	if startBackfill <= endBackfill {
-		log.Printf("🔄 Backfilling blocks from #%d to #%d after reorg", startBackfill, endBackfill)
-		for h := startBackfill; h <= endBackfill; h++ {
+
+	newHeight := newBlock.NumberU64()
+	newParent := newBlock.ParentHash().Hex()
+
+	// Case 2: Perfect successor
+	if newHeight == local.Height+1 && newParent == local.Hash {
+		return StatusCanonical
+	}
+
+	// Case 3: Block is from the future (Gap)
+	// NOTE: We do not trigger reorg logic for gaps.
+	if newHeight > local.Height+1 {
+		return StatusGap
+	}
+
+	// Case 4: Everything else (Height <= LocalHeight OR Parent mismatch) is a Reorg
+	return StatusReorg
+}
+
+// =================================================================================
+// Reorg Handling Logic
+// =================================================================================
+
+// ResolveReorg handles chain reorganizations by finding a common ancestor
+// and rewriting history.
+func (a *App) ResolveReorg(ctx context.Context, localTip *model.SQLBlock, newHead *types.Block) error {
+	// 1. Find the point where our chain diverged from the canonical chain
+	commonAncestorHeight, err := a.findCommonAncestor(ctx, localTip.Height)
+	if err != nil {
+		return fmt.Errorf("failed to find common ancestor: %w", err)
+	}
+
+	// 2. Fill the gap from the ancestor to the new head
+	// This overwrites any invalid blocks in our DB with canonical ones.
+	startFix := commonAncestorHeight + 1
+	endFix := newHead.NumberU64()
+
+	if startFix <= endFix {
+		log.Printf("🔄 Repairing chain from #%d to #%d", startFix, endFix)
+		// Reuse sequential logic here for simplicity and safety during repair
+		for h := startFix; h <= endFix; h++ {
 			if err := a.fetchAndSaveBlock(ctx, int64(h)); err != nil {
 				return err
 			}
@@ -192,28 +262,47 @@ func (a *App) ResolveReorg(ctx context.Context, localTip *model.SQLBlock, newHea
 	return nil
 }
 
-// blockToSQLBlock converts an Ethereum block to a database-ready format
-func (a *App) blockToSQLBlock(block *types.Block) model.SQLBlock {
-	baseFee := "0"
-	if block.BaseFee() != nil {
-		baseFee = block.BaseFee().String()
-	}
+// findCommonAncestor walks backwards from current height to find a block hash match.
+func (a *App) findCommonAncestor(ctx context.Context, startHeight uint64) (uint64, error) {
+	currentHeight := startHeight
 
-	return model.SQLBlock{
-		Height:    block.NumberU64(),
-		Hash:      block.Hash().Hex(),
-		Timestamp: time.Unix(int64(block.Time()), 0),
-		TxCount:   len(block.Transactions()),
-		BaseFee:   baseFee,
+	for currentHeight > 0 {
+		// A. Fetch canonical block from chain
+		onChainBlock, err := a.EthClient.BlockByNumber(ctx, big.NewInt(int64(currentHeight)))
+		if err != nil {
+			return 0, fmt.Errorf("rpc failed for #%d: %w", currentHeight, err)
+		}
+
+		// B. Fetch local block
+		localBlock, err := a.BlockRepo.GetByHeight(currentHeight)
+		if err != nil {
+			return 0, fmt.Errorf("db failed for #%d: %w", currentHeight, err)
+		}
+
+		// C. Compare Hashes
+		if localBlock.Hash != onChainBlock.Hash().Hex() {
+			log.Printf("🔪 Fixing block #%d (Local: %s != Chain: %s)",
+				currentHeight, localBlock.Hash, onChainBlock.Hash().Hex())
+
+			// Overwrite the bad block immediately
+			if err := a.saveBlock(onChainBlock); err != nil {
+				return 0, err
+			}
+			currentHeight--
+		} else {
+			// Match found! This is our common ancestor.
+			log.Printf("⚓ Common ancestor found at #%d", currentHeight)
+			return currentHeight, nil
+		}
 	}
+	return 0, nil
 }
 
-func (a *App) saveBlock(block *types.Block) error {
-	sqlBlock := a.blockToSQLBlock(block)
-	return a.BlockRepo.Save(&sqlBlock)
-}
+// =================================================================================
+// Backfill & Sync Logic
+// =================================================================================
 
-// Backfill synchronizes historical blocks that were missed
+// Backfill checks for missing historical data and starts synchronization.
 func (a *App) Backfill(ctx context.Context) error {
 	log.Println("🔍 Checking data continuity...")
 
@@ -229,112 +318,130 @@ func (a *App) Backfill(ctx context.Context) error {
 
 	log.Printf("📊 Status check: Local [#%d] vs Chain [#%d]", localHeight, remoteHeight)
 
-	// First run: skip to recent blocks instead of syncing entire history
+	// Optimization: Skip history on fresh install
 	if localHeight == 0 && remoteHeight > blockLookbackDistance {
-		log.Printf("⚠️ First run, skipping historical data, only syncing last %d blocks", blockLookbackDistance)
+		log.Printf("⚠️ First run, skipping history. Syncing last %d blocks.", blockLookbackDistance)
 		localHeight = remoteHeight - blockLookbackDistance
 	}
 
 	if localHeight >= remoteHeight {
-		log.Println("✅ Data already synced, no backfill needed")
+		log.Println("✅ Data already synced.")
 		return nil
 	}
 
-	return a.syncMissingBlocks(ctx, localHeight, remoteHeight)
+	return a.runWorkerPool(ctx, localHeight, remoteHeight)
 }
 
-// syncMissingBlocks fills in blocks between local and remote heights using worker pool
-func (a *App) syncMissingBlocks(ctx context.Context, localHeight, remoteHeight uint64) error {
-	missingCount := remoteHeight - localHeight
-	log.Printf("⚡️ Detected %d blocks behind, starting sync...", missingCount)
+// runWorkerPool manages concurrent workers to fetch missing blocks.
+func (a *App) runWorkerPool(ctx context.Context, startHeight, endHeight uint64) error {
+	missingCount := endHeight - startHeight
+	log.Printf("⚡️ Starting backfill for %d blocks...", missingCount)
 
-	blockChan := make(chan uint64, defaultWorkerCount*logChannelBufferSize)
+	// Buffered channel to hold jobs
+	jobs := make(chan uint64, defaultWorkerCount*logChannelBufferSize)
 	var wg sync.WaitGroup
 
-	// Start worker goroutines
-	for workerID := 0; workerID < defaultWorkerCount; workerID++ {
+	// 1. Start Workers
+	for i := 0; i < defaultWorkerCount; i++ {
 		wg.Add(1)
-		go a.blockSyncWorker(ctx, workerID, blockChan, &wg)
+		go func(workerID int) {
+			defer wg.Done()
+			a.workerTask(ctx, workerID, jobs)
+		}(i)
 	}
 
-	// Distribute blocks to workers
-	for blockNumber := localHeight + 1; blockNumber <= remoteHeight; blockNumber++ {
-		select {
-		case <-ctx.Done():
-			close(blockChan)
-			return ctx.Err()
-		case blockChan <- blockNumber:
+	// 2. Dispatch Jobs
+	// Push jobs to channel until done or context cancelled
+	go func() {
+		for h := startHeight + 1; h <= endHeight; h++ {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- h:
+			}
 		}
-	}
+		close(jobs)
+	}()
 
-	close(blockChan)
+	// 3. Wait for completion
 	wg.Wait()
-	log.Println("✅ Backfill complete! All historical blocks saved.")
+	log.Println("✅ Backfill complete!")
 	return nil
 }
 
-// blockSyncWorker processes blocks from the channel
-func (a *App) blockSyncWorker(ctx context.Context, workerID int, blockChan chan uint64, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	for blockNumber := range blockChan {
-		if err := a.fetchAndSaveBlockWithRetry(ctx, int64(blockNumber)); err != nil {
-			a.AsyncLog("❌ [Worker %d] Failed #%d: %v", workerID, blockNumber, err)
+// workerTask is the logic loop for a single worker.
+func (a *App) workerTask(ctx context.Context, workerID int, jobs <-chan uint64) {
+	for height := range jobs {
+		if err := a.fetchAndSaveBlockWithRetry(ctx, int64(height)); err != nil {
+			a.AsyncLog("❌ [Worker %d] Failed #%d: %v", workerID, height, err)
 		} else {
-			// Log progress at intervals
-			if blockNumber%progressReportInterval == 0 {
-				a.AsyncLog("✅ [Worker %d] Synced #%d", workerID, blockNumber)
+			if height%progressReportInterval == 0 {
+				a.AsyncLog("✅ [Worker %d] Synced #%d", workerID, height)
 			}
 		}
 	}
 }
 
+// fetchAndSaveBlockWithRetry attempts to fetch a block with exponential backoff.
 func (a *App) fetchAndSaveBlockWithRetry(ctx context.Context, height int64) error {
-	maxRetries := 3
-	baseDelay := time.Second
-
 	for i := 0; i < maxRetries; i++ {
 		err := a.fetchAndSaveBlock(ctx, height)
 		if err == nil {
 			return nil
 		}
 
-		a.AsyncLog("❌ Retry %d for block #%d failed: %v", i+1, height, err)
-		delay := baseDelay * time.Duration(1<<i) // Exponential backoff
+		// Calculate delay: 1s, 2s, 4s...
+		delay := retryBaseDelay * time.Duration(1<<i)
+		a.AsyncLog("⚠️ Retry %d/%d for block #%d (Error: %v)", i+1, maxRetries, height, err)
 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(delay):
-			// Continue to next retry
+			// Retry after delay
 		}
 	}
-	return fmt.Errorf("failed to fetch and save block #%d after %d retries", height, maxRetries)
+	return fmt.Errorf("exceeded max retries for block #%d", height)
 }
 
-// fetchAndSaveBlock retrieves a single block and persists it
+// =================================================================================
+// Helpers & Utilities
+// =================================================================================
+
 func (a *App) fetchAndSaveBlock(ctx context.Context, height int64) error {
 	block, err := a.EthClient.BlockByNumber(ctx, big.NewInt(height))
 	if err != nil {
 		return err
 	}
+	return a.saveBlock(block)
+}
 
-	sqlBlock := a.blockToSQLBlock(block)
+func (a *App) saveBlock(block *types.Block) error {
+	// Convert Go-Ethereum type to our SQL model
+	sqlBlock := model.SQLBlock{
+		Height:    block.NumberU64(),
+		Hash:      block.Hash().Hex(),
+		Timestamp: time.Unix(int64(block.Time()), 0),
+		TxCount:   len(block.Transactions()),
+		BaseFee:   "0",
+	}
+	if block.BaseFee() != nil {
+		sqlBlock.BaseFee = block.BaseFee().String()
+	}
+
 	return a.BlockRepo.Save(&sqlBlock)
 }
 
-// startLogger continuously processes log messages from LogChan
 func (a *App) startLogger() {
 	for msg := range a.LogChan {
 		log.Println(msg)
 	}
 }
 
-// AsyncLog sends a formatted message to the log channel without blocking
 func (a *App) AsyncLog(format string, v ...interface{}) {
 	select {
 	case a.LogChan <- fmt.Sprintf(format, v...):
 	default:
-		// Channel full - discard to prevent blocking business logic
+		// Drop log if channel is full to prevent blocking
 	}
 }
